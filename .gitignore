@@ -1,0 +1,14 @@
+node_modules
+dist
+.tsbuild
+.DS_Store
+coverage
+data/downloads/*
+data/logs/*
+data/profiles/*
+.run/
+!data/downloads/.gitkeep
+!data/logs/.gitkeep
+!data/profiles/.gitkeep
+apps/server/.cache
+apps/server/tmp
