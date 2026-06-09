@@ -99,6 +99,14 @@ export const api = {
   getResourceContentUrl(resourceId: string) {
     return `${API_BASE}/api/resources/${resourceId}/content`;
   },
+  revealDownloadedFile(resourceId: string) {
+    return request<{ revealed: boolean; filePath: string }>(
+      `/api/resources/${resourceId}/reveal`,
+      {
+        method: "POST"
+      }
+    );
+  },
   getSettings() {
     return request<SettingsResponse>("/api/settings");
   },

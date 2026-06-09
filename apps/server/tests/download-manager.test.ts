@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { DetectedResource } from "@video/shared";
 
@@ -183,6 +183,100 @@ describe("download manager", () => {
     expect(resolved).toBe("/app/vendor/ffmpeg");
   });
 
+  it("falls back to the ffmpeg command when fixed paths and bundle are unavailable", async () => {
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        existsSync(candidate: Parameters<typeof actual.existsSync>[0]) {
+          if (
+            typeof candidate === "string" &&
+            (
+              candidate === "/opt/homebrew/bin/ffmpeg" ||
+              candidate === "/usr/local/bin/ffmpeg" ||
+              candidate.includes("ffmpeg-static/ffmpeg")
+            )
+          ) {
+            return false;
+          }
+          return actual.existsSync(candidate);
+        }
+      };
+    });
+
+    try {
+      const { createDownloadManager } = await import(
+        "../src/downloads/download-manager.js"
+      );
+
+      const rootDir = mkdtempSync(join(tmpdir(), "video-download-"));
+      createdPaths.push(rootDir);
+
+      const resource: DetectedResource = {
+        id: "resource-path-fallback",
+        taskId: "task-1",
+        url: "https://cdn.example.com/master.m3u8",
+        format: "m3u8",
+        mimeType: "application/vnd.apple.mpegurl",
+        referer: "https://example.com/watch",
+        userAgent: "test-agent",
+        cookie: null,
+        headers: {},
+        titleHint: "path fallback playlist",
+        sizeHint: null,
+        selected: true,
+        downloadStatus: "idle",
+        downloadedBytes: 0,
+        totalBytes: null,
+        speedBytesPerSecond: null,
+        outputFilePath: null,
+        errorMessage: null
+      };
+
+      let spawnedCommand: string | null = null;
+      const manager = createDownloadManager({
+        downloadDirectory: rootDir,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (url === resource.url) {
+            return new Response(
+              [
+                "#EXTM3U",
+                "#EXT-X-VERSION:3",
+                "#EXTINF:10,",
+                "segment-1.ts",
+                "#EXT-X-ENDLIST"
+              ].join("\n")
+            );
+          }
+
+          if (url === "https://cdn.example.com/segment-1.ts") {
+            return new Response("plain transport payload");
+          }
+
+          throw new Error(`unexpected url ${url}`);
+        },
+        spawnImpl: (command, args) => {
+          spawnedCommand = command;
+          const inputPath = args[args.indexOf("-i") + 1];
+          const outputPath = args.at(-1);
+          writeFileSync(outputPath!, readFileSync(inputPath));
+          return createMockChildProcess();
+        }
+      });
+
+      const result = await manager.download(resource);
+
+      expect(spawnedCommand).toBe("ffmpeg");
+      expect(result.filePath.endsWith(".mp4")).toBe(true);
+      expect(readFileSync(result.filePath, "utf8")).toBe("plain transport payload");
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  });
+
   it("downloads encrypted hls playlists natively without requiring ffmpeg", async () => {
     const { createDownloadManager } = await import(
       "../src/downloads/download-manager.js"
@@ -302,6 +396,8 @@ describe("download manager", () => {
       errorMessage: null
     };
 
+    const statusUpdates: Array<{ status: string; outputFilePath: string | null }> = [];
+
     const manager = createDownloadManager({
       downloadDirectory: rootDir,
       ffmpegExecutable: "/opt/homebrew/bin/ffmpeg",
@@ -339,12 +435,26 @@ describe("download manager", () => {
       }
     });
 
-    const result = await manager.download(resource);
+    const result = await manager.download(resource, {
+      onStatusChange(snapshot) {
+        statusUpdates.push(snapshot);
+      }
+    });
 
     expect(result.filePath.endsWith(".mp4")).toBe(true);
     expect(readFileSync(result.filePath, "utf8")).toBe("plain transport payload");
     expect(existsSync(`${result.filePath}.ts`)).toBe(false);
     expect(result.method).toBe("remux");
+    expect(statusUpdates).toEqual([
+      {
+        status: "downloading",
+        outputFilePath: null
+      },
+      {
+        status: "remuxing",
+        outputFilePath: join(rootDir, "remux playlist.mp4.ts")
+      }
+    ]);
   });
 
   it("cleans yt-dlp temporary fragments after fallback completes", async () => {
@@ -398,6 +508,88 @@ describe("download manager", () => {
     expect(readFileSync(result.filePath, "utf8")).toBe("merged transport stream");
     expect(existsSync(`${outputPath}.ytdl`)).toBe(false);
     expect(existsSync(`${outputPath}-Frag148`)).toBe(false);
+  });
+
+  it("prefers higher resolution variants and parses codec lists safely", async () => {
+    const { createDownloadManager } = await import(
+      "../src/downloads/download-manager.js"
+    );
+
+    const rootDir = mkdtempSync(join(tmpdir(), "video-download-"));
+    createdPaths.push(rootDir);
+
+    const resource: DetectedResource = {
+      id: "resource-7",
+      taskId: "task-1",
+      url: "https://cdn.example.com/master.m3u8",
+      format: "m3u8",
+      mimeType: "application/vnd.apple.mpegurl",
+      referer: "https://example.com/watch",
+      userAgent: "test-agent",
+      cookie: null,
+      headers: {},
+      titleHint: "variant playlist",
+      sizeHint: null,
+      selected: true,
+      downloadStatus: "idle",
+      downloadedBytes: 0,
+      totalBytes: null,
+      speedBytesPerSecond: null,
+      outputFilePath: null,
+      errorMessage: null
+    };
+
+    const requestedUrls: string[] = [];
+    const manager = createDownloadManager({
+      downloadDirectory: rootDir,
+      ffmpegExecutable: null,
+      fetchImpl: async (input) => {
+        const url = String(input);
+        requestedUrls.push(url);
+
+        if (url === resource.url) {
+          return new Response(
+            [
+              "#EXTM3U",
+              '#EXT-X-STREAM-INF:BANDWIDTH=500000,AVERAGE-BANDWIDTH=450000,RESOLUTION=1280x720,CODECS="avc1.4d401f,mp4a.40.2"',
+              "mid.m3u8",
+              '#EXT-X-STREAM-INF:BANDWIDTH=300000,AVERAGE-BANDWIDTH=250000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"',
+              "hi.m3u8"
+            ].join("\n")
+          );
+        }
+
+        if (url === "https://cdn.example.com/hi.m3u8") {
+          return new Response(
+            [
+              "#EXTM3U",
+              "#EXTINF:10,",
+              "segment-hi.ts",
+              "#EXT-X-ENDLIST"
+            ].join("\n")
+          );
+        }
+
+        if (url === "https://cdn.example.com/segment-hi.ts") {
+          return new Response("higher resolution payload");
+        }
+
+        if (url === "https://cdn.example.com/mid.m3u8") {
+          throw new Error("lower resolution variant should not be requested");
+        }
+
+        throw new Error(`unexpected url ${url}`);
+      },
+      spawnImpl: () => {
+        throw new Error("spawn should not be called for native hls");
+      }
+    });
+
+    const result = await manager.download(resource);
+
+    expect(readFileSync(result.filePath, "utf8")).toBe("higher resolution payload");
+    expect(requestedUrls).toContain("https://cdn.example.com/hi.m3u8");
+    expect(requestedUrls).not.toContain("https://cdn.example.com/mid.m3u8");
   });
 });
 

@@ -1,5 +1,9 @@
 import { useState } from "react";
-import type { ManagedVideoItem } from "@video/shared";
+import {
+  getResourceDownloadStatusLabel,
+  isActiveResourceDownloadStatus,
+  type ManagedVideoItem
+} from "@video/shared";
 import { cn } from "./ui/cn";
 import { Panel } from "./ui/panel";
 import { Button } from "./ui/button";
@@ -17,7 +21,7 @@ function formatSpeed(value: number | null): string {
 function progressPercent(resource: ManagedVideoItem): number {
   if (resource.downloadStatus === "completed") return 100;
   if (!resource.totalBytes || resource.totalBytes <= 0) {
-    return resource.downloadStatus === "downloading" ? 35 : 0;
+    return isActiveResourceDownloadStatus(resource.downloadStatus) ? 35 : 0;
   }
   return Math.max(
     0,
@@ -33,10 +37,7 @@ function progressLabel(resource: ManagedVideoItem): string {
 }
 
 function statusLabel(resource: ManagedVideoItem): string {
-  if (resource.downloadStatus === "downloading") return "下载中";
-  if (resource.downloadStatus === "completed") return "下载完成";
-  if (resource.downloadStatus === "failed") return "下载失败";
-  return "等待下载";
+  return getResourceDownloadStatusLabel(resource.downloadStatus);
 }
 
 function CollapsibleLink({

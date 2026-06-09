@@ -1,5 +1,5 @@
 import { createServer, type Server } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -140,5 +140,101 @@ describe("app server", () => {
     expect(taskDetail.logs.length).toBeGreaterThan(0);
 
     await reader.cancel();
+  });
+
+  it("reveals a downloaded file location for completed resources", async () => {
+    const { createAppStore } = await import("../src/persistence/app-store.js");
+    const { createTaskQueue } = await import("../src/queue/task-queue.js");
+    const { createAppServer } = await import("../src/http/app-server.js");
+
+    const rootDir = mkdtempSync(join(tmpdir(), "video-api-"));
+    createdPaths.push(rootDir);
+
+    const outputDir = join(rootDir, "downloads");
+    mkdirSync(outputDir, { recursive: true });
+    const outputPath = join(outputDir, "completed.mp4");
+    writeFileSync(outputPath, "demo");
+
+    const store = createAppStore(join(rootDir, "app.db"), rootDir);
+    const [task] = store.createTasks(["https://example.com/watch"]);
+    const resource = store.addResource(task.id, {
+      url: "https://cdn.example.com/movie.mp4",
+      format: "mp4",
+      mimeType: "video/mp4",
+      referer: task.sourceUrl,
+      userAgent: null,
+      cookie: null,
+      headers: {},
+      titleHint: "demo video",
+      sizeHint: null,
+      selected: true,
+      downloadStatus: "completed",
+      downloadedBytes: 4,
+      totalBytes: 4,
+      speedBytesPerSecond: null,
+      outputFilePath: outputPath,
+      errorMessage: null
+    });
+
+    const revealedPaths: string[] = [];
+    const queue = createTaskQueue({
+      store,
+      autoDownload: false,
+      browserManager: {
+        async openSession() {
+          return {
+            page: {},
+            close: async () => undefined
+          };
+        }
+      },
+      detectResources: async () => ({
+        status: "failed" as const,
+        resources: [],
+        message: "unused"
+      }),
+      downloadResource: async () => ({
+        filePath: outputPath,
+        downloadedBytes: 4,
+        totalBytes: 4,
+        method: "direct" as const
+      })
+    });
+
+    const { app } = createAppServer({
+      store,
+      queue,
+      browserManager: {
+        async openSession() {
+          return {
+            page: {},
+            close: async () => undefined
+          };
+        }
+      },
+      revealFileInOs: async (filePath) => {
+        revealedPaths.push(filePath);
+      }
+    });
+
+    const server = createServer(app);
+    servers.push(server);
+
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const address = server.address();
+    if (typeof address !== "object" || address === null) {
+      throw new Error("failed to open api server");
+    }
+
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const response = await fetch(`${baseUrl}/api/resources/${resource.id}/reveal`, {
+      method: "POST"
+    });
+    const body = await response.json() as { revealed: boolean; filePath: string };
+
+    expect(response.ok).toBe(true);
+    expect(body.revealed).toBe(true);
+    expect(body.filePath).toBe(outputPath);
+    expect(revealedPaths).toEqual([outputPath]);
   });
 });

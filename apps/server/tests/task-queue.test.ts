@@ -131,6 +131,82 @@ describe("task queue", () => {
     expect(task.status).toBe("completed");
   });
 
+  it("records stage logs while an hls resource progresses through download phases", async () => {
+    const { createAppStore } = await import("../src/persistence/app-store.js");
+    const { createTaskQueue } = await import("../src/queue/task-queue.js");
+
+    const rootDir = mkdtempSync(join(tmpdir(), "video-queue-"));
+    createdPaths.push(rootDir);
+
+    const store = createAppStore(join(rootDir, "app.db"), rootDir);
+
+    const queue = createTaskQueue({
+      store,
+      autoDownload: true,
+      browserManager: {
+        async openSession() {
+          return {
+            page: {},
+            close: async () => {}
+          };
+        }
+      },
+      detectResources: async () => ({
+        status: "detected" as const,
+        resources: [
+          {
+            id: "resource-hls",
+            taskId: "pending",
+            url: "https://cdn.example.com/master.m3u8",
+            format: "m3u8",
+            mimeType: "application/vnd.apple.mpegurl",
+            referer: null,
+            userAgent: null,
+            cookie: null,
+            headers: {},
+            titleHint: "HLS demo",
+            sizeHint: null,
+            selected: true
+          } satisfies DetectedResource
+        ]
+      }),
+      downloadResource: async (_resource, options) => {
+        options?.onStatusChange?.({
+          status: "downloading",
+          outputFilePath: null
+        });
+        options?.onProgress?.({
+          downloadedBytes: 128,
+          totalBytes: null,
+          speedBytesPerSecond: 64
+        });
+        options?.onStatusChange?.({
+          status: "merging",
+          outputFilePath: "/tmp/hls-demo.ts"
+        });
+        options?.onStatusChange?.({
+          status: "remuxing",
+          outputFilePath: "/tmp/hls-demo.mp4.ts"
+        });
+        return {
+          filePath: "/tmp/hls-demo.mp4",
+          downloadedBytes: 256,
+          totalBytes: null,
+          method: "remux" as const
+        };
+      }
+    });
+
+    const [task] = await queue.submit(["https://example.com/watch"]);
+    const detail = store.getTaskDetail(task.id);
+    const logMessages = detail.logs.map((log) => log.message);
+
+    expect(logMessages).toContain("HLS demo：开始下载");
+    expect(logMessages).toContain("HLS demo：开始合并 m3u8 分片");
+    expect(logMessages).toContain("HLS demo：开始转 MP4");
+    expect(logMessages).toContain("HLS demo：下载完成");
+  });
+
   it("marks a task as failed and allows retry", async () => {
     const { createAppStore } = await import("../src/persistence/app-store.js");
     const { createTaskQueue } = await import("../src/queue/task-queue.js");
@@ -152,14 +228,35 @@ describe("task queue", () => {
           };
         }
       },
-      detectResources: async () => {
+      detectResources: async ({ task }) => {
         attempts += 1;
         if (attempts === 1) {
           throw new Error("login required");
         }
         return {
           status: "detected" as const,
-          resources: []
+          resources: [
+            {
+              id: `resource-${task.id}`,
+              taskId: task.id,
+              url: "https://cdn.example.com/retry-success.mp4",
+              format: "mp4",
+              mimeType: "video/mp4",
+              referer: task.sourceUrl,
+              userAgent: null,
+              cookie: null,
+              headers: {},
+              titleHint: "retry success",
+              sizeHint: null,
+              selected: false,
+              downloadStatus: "idle",
+              downloadedBytes: 0,
+              totalBytes: null,
+              speedBytesPerSecond: null,
+              outputFilePath: null,
+              errorMessage: null
+            } satisfies DetectedResource
+          ]
         };
       },
       downloadResource: async () => {
@@ -357,5 +454,64 @@ describe("task queue", () => {
     expect(resources).toHaveLength(1);
     expect(resources[0].format).toBe("m3u8");
     expect(resources[0].url).toBe("https://cdn.example.com/master.m3u8");
+  });
+
+  it("marks a task as failed when only unsupported resources are detected", async () => {
+    const { createAppStore } = await import("../src/persistence/app-store.js");
+    const { createTaskQueue } = await import("../src/queue/task-queue.js");
+
+    const rootDir = mkdtempSync(join(tmpdir(), "video-queue-"));
+    createdPaths.push(rootDir);
+
+    const store = createAppStore(join(rootDir, "app.db"), rootDir);
+
+    const queue = createTaskQueue({
+      store,
+      autoDownload: false,
+      browserManager: {
+        async openSession() {
+          return {
+            page: {},
+            close: async () => {}
+          };
+        }
+      },
+      detectResources: async ({ task }) => ({
+        status: "detected" as const,
+        resources: [
+          {
+            id: `blob-${task.id}`,
+            taskId: task.id,
+            url: "blob:https://example.com/demo",
+            format: "unknown",
+            mimeType: null,
+            referer: task.sourceUrl,
+            userAgent: null,
+            cookie: null,
+            headers: {},
+            titleHint: "blob video",
+            sizeHint: null,
+            selected: false,
+            downloadStatus: "idle",
+            downloadedBytes: 0,
+            totalBytes: null,
+            speedBytesPerSecond: null,
+            outputFilePath: null,
+            errorMessage: null
+          } satisfies DetectedResource
+        ]
+      }),
+      downloadResource: async () => {
+        throw new Error("download should not be called");
+      }
+    });
+
+    const [task] = await queue.submit(["https://example.com/watch"]);
+    const detail = store.getTaskDetail(task.id);
+
+    expect(task.status).toBe("failed");
+    expect(detail.task.errorMessage).toBe("detected resources are not supported for download");
+    expect(detail.resources).toHaveLength(0);
+    expect(detail.logs.at(-1)?.message).toBe("detected resources are not supported for download");
   });
 });

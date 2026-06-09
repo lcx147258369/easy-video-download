@@ -3,6 +3,8 @@ import type { TaskStatus } from "./task.js";
 export const RESOURCE_DOWNLOAD_STATUSES = [
   "idle",
   "downloading",
+  "merging",
+  "remuxing",
   "completed",
   "failed"
 ] as const;
@@ -37,4 +39,25 @@ export interface ManagedVideoItem extends DetectedResource {
   taskStatus: TaskStatus;
   taskUpdatedAt: string;
   taskErrorMessage: string | null;
+}
+
+export function getResourceDownloadStatusLabel(
+  status: ResourceDownloadStatus
+): string {
+  if (status === "downloading") return "下载中";
+  if (status === "merging") return "合并中";
+  if (status === "remuxing") return "转 MP4 中";
+  if (status === "completed") return "下载完成";
+  if (status === "failed") return "下载失败";
+  return "等待下载";
+}
+
+export function isActiveResourceDownloadStatus(
+  status: ResourceDownloadStatus
+): boolean {
+  return (
+    status === "downloading" ||
+    status === "merging" ||
+    status === "remuxing"
+  );
 }

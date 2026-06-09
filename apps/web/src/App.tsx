@@ -7,13 +7,14 @@ import {
   type TaskDetailResponse,
   type TaskRecord
 } from "@video/shared";
-import { startTransition, useEffect, useEffectEvent, useState } from "react";
+import type { ReactNode } from "react";
+import { startTransition, useEffect, useEffectEvent, useRef, useState } from "react";
 
-import { ResourceSummaryStrip } from "./components/resource-summary-strip";
 import { SettingsPanel } from "./components/settings-panel";
 import { TaskComposer } from "./components/task-composer";
 import { TaskDetail } from "./components/task-detail";
 import { TaskTable } from "./components/task-table";
+import { GlobalDownloadMonitor } from "./components/global-download-monitor";
 import { Button } from "./components/ui/button";
 import { Panel } from "./components/ui/panel";
 import { api } from "./lib/api";
@@ -37,6 +38,17 @@ export function App() {
   const [submittingTasks, setSubmittingTasks] = useState(false);
   const [connectionLabel, setConnectionLabel] = useState("connecting");
   const [previewingResource, setPreviewingResource] = useState<PreviewResource | null>(null);
+  const [showSettingsPanel, setShowSettingsPanel] = useState(false);
+  const [showDownloadCenter, setShowDownloadCenter] = useState(false);
+  const pendingCreatedTaskUrlsRef = useRef<string[]>([]);
+  const selectedTaskIdRef = useRef<string | null>(null);
+  const taskDetailRequestIdRef = useRef(0);
+  const taskStateEpochRef = useRef(0);
+  const resourceStateEpochRef = useRef(0);
+
+  useEffect(() => {
+    selectedTaskIdRef.current = selectedTaskId;
+  }, [selectedTaskId]);
 
   const refreshSettings = useEffectEvent(async () => {
     try {
@@ -50,8 +62,12 @@ export function App() {
   });
 
   const refreshTasks = useEffectEvent(async () => {
+    const epochAtStart = taskStateEpochRef.current;
     try {
       const response = await api.listTasks();
+      if (taskStateEpochRef.current !== epochAtStart) {
+        return;
+      }
       startTransition(() => {
         setTasks(response.tasks);
         setSelectedTaskId((current) => {
@@ -70,8 +86,12 @@ export function App() {
   });
 
   const refreshResources = useEffectEvent(async () => {
+    const epochAtStart = resourceStateEpochRef.current;
     try {
       const response = await api.listResources();
+      if (resourceStateEpochRef.current !== epochAtStart) {
+        return;
+      }
       startTransition(() => {
         setResources(response.resources);
       });
@@ -81,7 +101,7 @@ export function App() {
   });
 
   const refreshTaskDetail = useEffectEvent(async (taskId?: string | null) => {
-    const nextTaskId = taskId ?? selectedTaskId;
+    const nextTaskId = taskId ?? selectedTaskIdRef.current;
     if (!nextTaskId) {
       startTransition(() => {
         setSelectedTaskDetail(null);
@@ -90,8 +110,17 @@ export function App() {
       return;
     }
 
+    const requestId = ++taskDetailRequestIdRef.current;
+
     try {
       const response = await api.getTask(nextTaskId);
+      if (
+        taskDetailRequestIdRef.current !== requestId ||
+        selectedTaskIdRef.current !== nextTaskId
+      ) {
+        return;
+      }
+      mergeTask(response.task);
       startTransition(() => {
         setSelectedTaskDetail(response);
         setSelectedResourceIds((current) => {
@@ -111,6 +140,7 @@ export function App() {
   });
 
   const mergeTask = useEffectEvent((task: TaskRecord) => {
+    taskStateEpochRef.current += 1;
     startTransition(() => {
       setTasks((current) => {
         const index = current.findIndex((item) => item.id === task.id);
@@ -137,6 +167,8 @@ export function App() {
   });
 
   const removeTask = useEffectEvent((taskId: string) => {
+    taskStateEpochRef.current += 1;
+    resourceStateEpochRef.current += 1;
     startTransition(() => {
       setTasks((current) => current.filter((task) => task.id !== taskId));
       setResources((current) => current.filter((resource) => resource.taskId !== taskId));
@@ -150,6 +182,7 @@ export function App() {
   });
 
   const removeResource = useEffectEvent((resourceId: string) => {
+    resourceStateEpochRef.current += 1;
     startTransition(() => {
       setResources((current) => current.filter((resource) => resource.id !== resourceId));
       setSelectedTaskDetail((current) =>
@@ -174,6 +207,44 @@ export function App() {
     void refreshTaskDetail(selectedTaskId);
   }, [selectedTaskId]);
 
+  useEffect(() => {
+    if (tasks.length === 0) {
+      return;
+    }
+
+    const hasSelectedTask = selectedTaskId
+      ? tasks.some((task) => task.id === selectedTaskId)
+      : false;
+
+    if (!hasSelectedTask) {
+      setSelectedTaskId(tasks[0].id);
+    }
+  }, [tasks, selectedTaskId]);
+
+  useEffect(() => {
+    if (!selectedTaskId) {
+      return;
+    }
+
+    const selectedTask = tasks.find((task) => task.id === selectedTaskId);
+    if (!selectedTask) {
+      return;
+    }
+
+    setSelectedTaskDetail((current) => {
+      if (current?.task.id === selectedTask.id) {
+        return current;
+      }
+
+      return {
+        task: selectedTask,
+        resources: [],
+        logs: []
+      };
+    });
+    setSelectedResourceIds([]);
+  }, [tasks, selectedTaskId]);
+
   const handleServerEvent = useEffectEvent((event: ServerEvent) => {
     if (event.type === "app:ready") {
       setConnectionLabel("live");
@@ -192,6 +263,25 @@ export function App() {
 
     if (event.type === "task:state-changed") {
       mergeTask(event.task);
+      if (
+        pendingCreatedTaskUrlsRef.current.includes(event.task.sourceUrl) &&
+        !tasks.some((task) => task.id === event.task.id)
+      ) {
+        startTransition(() => {
+          setSelectedTaskId(event.task.id);
+          setSelectedTaskDetail({
+            task: event.task,
+            resources: [],
+            logs: []
+          });
+          setSelectedResourceIds([]);
+        });
+        pendingCreatedTaskUrlsRef.current = pendingCreatedTaskUrlsRef.current.filter(
+          (url) => url !== event.task.sourceUrl
+        );
+        void refreshTaskDetail(event.task.id);
+        return;
+      }
       if (event.task.id === selectedTaskId) {
         void refreshTaskDetail(event.task.id);
       }
@@ -199,21 +289,43 @@ export function App() {
     }
 
     if (event.type === "task:download-progress") {
-      setResources((current) =>
-        current.map((resource) =>
-          resource.id === event.resourceId
+      startTransition(() => {
+        setResources((current) =>
+          current.map((resource) =>
+            resource.id === event.resourceId
+              ? {
+                  ...resource,
+                  downloadStatus: event.downloadStatus,
+                  downloadedBytes: event.downloadedBytes,
+                  totalBytes: event.totalBytes,
+                  speedBytesPerSecond: event.speedBytesPerSecond,
+                  outputFilePath: event.outputFilePath,
+                  errorMessage: event.errorMessage
+                }
+              : resource
+          )
+        );
+        setSelectedTaskDetail((current) =>
+          current && current.task.id === event.taskId
             ? {
-                ...resource,
-                downloadStatus: event.downloadStatus,
-                downloadedBytes: event.downloadedBytes,
-                totalBytes: event.totalBytes,
-                speedBytesPerSecond: event.speedBytesPerSecond,
-                outputFilePath: event.outputFilePath,
-                errorMessage: event.errorMessage
+                ...current,
+                resources: current.resources.map((resource) =>
+                  resource.id === event.resourceId
+                    ? {
+                        ...resource,
+                        downloadStatus: event.downloadStatus,
+                        downloadedBytes: event.downloadedBytes,
+                        totalBytes: event.totalBytes,
+                        speedBytesPerSecond: event.speedBytesPerSecond,
+                        outputFilePath: event.outputFilePath,
+                        errorMessage: event.errorMessage
+                      }
+                    : resource
+                )
               }
-            : resource
-        )
-      );
+            : current
+        );
+      });
       if (event.taskId === selectedTaskId) {
         void refreshTaskDetail(event.taskId);
       }
@@ -290,21 +402,38 @@ export function App() {
       return;
     }
 
+    pendingCreatedTaskUrlsRef.current = urls;
+    taskStateEpochRef.current += 1;
     setSubmittingTasks(true);
     try {
       const response = await api.createTasks(urls);
       startTransition(() => {
         setComposerValue("");
-        setTasks((current) => [...response.tasks, ...current]);
+        setTasks((current) => mergeTaskRecords(response.tasks, current));
         setSelectedTaskId(response.tasks[0]?.id ?? null);
+        setSelectedTaskDetail(
+          response.tasks[0]
+            ? {
+                task: response.tasks[0],
+                resources: [],
+                logs: []
+              }
+            : null
+        );
+        setSelectedResourceIds([]);
       });
+      pendingCreatedTaskUrlsRef.current = [];
+      await refreshTaskDetail(response.tasks[0]?.id ?? null);
       await refreshResources();
     } finally {
+      pendingCreatedTaskUrlsRef.current = [];
       setSubmittingTasks(false);
     }
   }
 
   async function runTaskAction(id: string, action: () => Promise<void>) {
+    taskStateEpochRef.current += 1;
+    resourceStateEpochRef.current += 1;
     setBusyIds((current) => [...current, id]);
     try {
       await action();
@@ -349,60 +478,95 @@ export function App() {
   }
 
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null;
+  const activeDownloadCount = resources.filter((resource) =>
+    ["downloading", "merging", "remuxing"].includes(resource.downloadStatus)
+  ).length;
+  const completedDownloadCount = resources.filter(
+    (resource) => resource.downloadStatus === "completed"
+  ).length;
 
   return (
     <>
       <main className="min-h-screen bg-transparent px-4 py-5 text-stone-900 md:px-6 xl:px-8">
         <div className="mx-auto max-w-[1680px] space-y-4">
-          <Panel className="ui-hero-panel overflow-hidden border-[rgba(23,23,23,0.08)] px-5 py-5">
-            <div className="flex flex-wrap items-start justify-between gap-5">
-              <div className="max-w-4xl space-y-2">
-                <p className="font-mono text-[11px] uppercase tracking-[0.28em] text-stone-600">
-                  51cg Video Console
-                </p>
-                <h1 className="font-display text-[2.15rem] font-semibold tracking-tight text-[color:var(--ink-strong)] md:text-[2.6rem]">
-                  视频抓取工作台
-                </h1>
-                <p className="max-w-3xl text-sm leading-7 text-[color:var(--ink-body)] md:text-[15px]">
-                  按真实流程工作：先创建页面任务，再筛选识别出的资源，最后生成和查看下载任务。
-                </p>
+          <Panel className="ui-hero-panel overflow-hidden border-[rgba(23,23,23,0.08)] px-5 py-4">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div className="min-w-0 flex-1 space-y-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <p className="font-mono text-[11px] uppercase tracking-[0.28em] text-stone-600">
+                    51cg Video Console
+                  </p>
+                  <span className="inline-flex items-center rounded-full border border-stone-200 bg-white/80 px-3 py-1 text-[11px] font-medium text-stone-600">
+                    URL {"->"} 页面任务 {"->"} 资源任务
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-end justify-between gap-4">
+                  <div className="min-w-0">
+                    <h1 className="font-display text-[1.95rem] font-semibold tracking-tight text-[color:var(--ink-strong)] md:text-[2.25rem]">
+                      视频抓取工作台
+                    </h1>
+                  </div>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    <Button
+                      onClick={() => setShowDownloadCenter(true)}
+                      type="button"
+                      variant="secondary"
+                    >
+                      下载中心
+                    </Button>
+                    <Button
+                      onClick={() => setShowSettingsPanel(true)}
+                      type="button"
+                      variant="ghost"
+                    >
+                      运行设置
+                    </Button>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 border-t border-[rgba(23,23,23,0.08)] pt-3">
+                  <CompactMetric label="页面任务" value={String(tasks.length)} />
+                  <CompactMetric label="处理中" value={String(activeDownloadCount)} />
+                  <CompactMetric label="已完成" value={String(completedDownloadCount)} />
+                  <CompactMetric label="SSE" value={connectionLabel} />
+                </div>
               </div>
-
-              <div className="ui-panel-muted min-w-[132px] rounded-[1rem] px-4 py-3">
-                <p className="font-mono text-[11px] uppercase tracking-[0.24em] text-stone-600">
-                  SSE 状态
-                </p>
-                <p className="mt-1.5 font-display text-2xl font-semibold text-[color:var(--ink-strong)]">
-                  {connectionLabel}
-                </p>
-              </div>
+            </div>
+            <div className="mt-4 border-t border-[rgba(23,23,23,0.08)] pt-4">
+              <TaskComposer
+                busy={submittingTasks}
+                onChange={setComposerValue}
+                onSubmit={() => void handleSubmitTasks()}
+                value={composerValue}
+              />
             </div>
           </Panel>
 
-          <ResourceSummaryStrip resources={resources} />
-
-          <div className="grid gap-4 xl:grid-cols-[320px_420px_minmax(0,1fr)] xl:items-start">
-            <div className="space-y-4 xl:sticky xl:top-5 xl:self-start">
-              <Panel>
-                <TaskComposer
-                  busy={submittingTasks}
-                  onChange={setComposerValue}
-                  onSubmit={() => void handleSubmitTasks()}
-                  value={composerValue}
-                />
-              </Panel>
-
-              <SettingsPanel
-                busy={savingSettings}
-                onSave={(nextSettings) => void handleSaveSettings(nextSettings)}
-                settings={settings}
-              />
-            </div>
-
-            <div className="min-w-0 space-y-4">
+          <div className="grid gap-4 xl:grid-cols-[390px_minmax(0,1fr)] xl:items-start">
+            <div className="min-w-0 xl:sticky xl:top-5 xl:self-start">
               <TaskTable
+                busyTaskIds={new Set(busyIds)}
                 onDeleteSelected={() => {
                   void handleDeleteSelectedTasks();
+                }}
+                onDeleteTask={(taskId) => {
+                  void runTaskAction(taskId, async () => {
+                    await api.deleteTask(taskId);
+                  });
+                }}
+                onOpenTaskBrowser={(taskId) => {
+                  void runTaskAction(taskId, async () => {
+                    await api.openTaskBrowser(taskId);
+                  });
+                }}
+                onResumeTask={(taskId) => {
+                  void runTaskAction(taskId, async () => {
+                    await api.resumeTaskDetection(taskId);
+                  });
+                }}
+                onRetryTask={(taskId) => {
+                  void runTaskAction(taskId, async () => {
+                    await api.retryTask(taskId);
+                  });
                 }}
                 onSelect={setSelectedTaskId}
                 onToggleAll={() => {
@@ -428,12 +592,6 @@ export function App() {
               <TaskDetail
                 busy={selectedTask ? busyIds.includes(selectedTask.id) : false}
                 detail={selectedTaskDetail}
-                onDelete={() => {
-                  if (!selectedTask) return;
-                  void runTaskAction(selectedTask.id, async () => {
-                    await api.deleteTask(selectedTask.id);
-                  });
-                }}
                 onDownloadSelected={() => {
                   if (!selectedTask || selectedResourceIds.length === 0) {
                     return;
@@ -444,12 +602,6 @@ export function App() {
                     });
                   });
                 }}
-                onOpenBrowser={() => {
-                  if (!selectedTask) return;
-                  void runTaskAction(selectedTask.id, async () => {
-                    await api.openTaskBrowser(selectedTask.id);
-                  });
-                }}
                 onPreviewDownload={(resource) => {
                   setPreviewingResource({
                     id: resource.id,
@@ -458,16 +610,12 @@ export function App() {
                     outputFilePath: resource.outputFilePath
                   });
                 }}
-                onResume={() => {
-                  if (!selectedTask) return;
-                  void runTaskAction(selectedTask.id, async () => {
-                    await api.resumeTaskDetection(selectedTask.id);
-                  });
+                onRevealDownload={(resource) => {
+                  void api.revealDownloadedFile(resource.id);
                 }}
-                onRetry={() => {
-                  if (!selectedTask) return;
-                  void runTaskAction(selectedTask.id, async () => {
-                    await api.retryTask(selectedTask.id);
+                onRetryDownload={(resource) => {
+                  void runTaskAction(resource.taskId, async () => {
+                    await api.downloadResource(resource.id);
                   });
                 }}
                 onToggleResource={(resourceId) => {
@@ -484,6 +632,54 @@ export function App() {
           </div>
         </div>
       </main>
+
+      {showSettingsPanel ? (
+        <OverlayPanel
+          description="这里保留低频配置，避免和首页主操作抢注意力。"
+          title="运行设置"
+          onClose={() => setShowSettingsPanel(false)}
+        >
+          <SettingsPanel
+            busy={savingSettings}
+            onSave={(nextSettings) => void handleSaveSettings(nextSettings)}
+            settings={settings}
+          />
+        </OverlayPanel>
+      ) : null}
+
+      {showDownloadCenter ? (
+        <OverlayPanel
+          description="这里只看全局下载进度，不打断首页的页面任务处理。"
+          title="下载中心"
+          onClose={() => setShowDownloadCenter(false)}
+          wide
+        >
+          <GlobalDownloadMonitor
+            busyIds={new Set(busyIds)}
+            onFocusTask={(taskId) => {
+              setSelectedTaskId(taskId);
+              setShowDownloadCenter(false);
+            }}
+            onPreviewDownload={(resource) => {
+              setPreviewingResource({
+                id: resource.id,
+                titleHint: resource.titleHint,
+                url: resource.url,
+                outputFilePath: resource.outputFilePath
+              });
+            }}
+            onRevealDownload={(resource) => {
+              void api.revealDownloadedFile(resource.id);
+            }}
+            onRetryDownload={(resource) => {
+              void runTaskAction(resource.taskId, async () => {
+                await api.downloadResource(resource.id);
+              });
+            }}
+            resources={resources}
+          />
+        </OverlayPanel>
+      ) : null}
 
       {previewingResource ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/55 px-4 py-6">
@@ -517,5 +713,69 @@ export function App() {
         </div>
       ) : null}
     </>
+  );
+}
+
+function mergeTaskRecords(primary: TaskRecord[], secondary: TaskRecord[]): TaskRecord[] {
+  const merged = new Map<string, TaskRecord>();
+
+  for (const task of primary) {
+    merged.set(task.id, task);
+  }
+
+  for (const task of secondary) {
+    if (!merged.has(task.id)) {
+      merged.set(task.id, task);
+    }
+  }
+
+  return [...merged.values()];
+}
+
+function CompactMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="inline-flex items-center gap-2 rounded-full border border-[rgba(23,23,23,0.08)] bg-white/72 px-3 py-1.5">
+      <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-stone-500">
+        {label}
+      </span>
+      <span className="line-clamp-1 font-display text-base font-semibold text-stone-900">
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function OverlayPanel({
+  title,
+  description,
+  wide = false,
+  onClose,
+  children
+}: {
+  title: string;
+  description: string;
+  wide?: boolean;
+  onClose(): void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-stone-950/45 px-4 py-6">
+      <div
+        className={`w-full rounded-[1.6rem] border border-[rgba(82,63,43,0.16)] bg-[linear-gradient(180deg,rgba(255,251,245,0.98),rgba(240,232,220,0.95))] p-5 shadow-[0_30px_90px_rgba(28,25,23,0.28)] ${
+          wide ? "max-w-6xl" : "max-w-4xl"
+        }`}
+      >
+        <div className="mb-5 flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <p className="font-display text-2xl font-semibold text-[color:var(--ink-strong)]">
+              {title}
+            </p>
+            <p className="mt-1 text-sm text-[color:var(--ink-body)]">{description}</p>
+          </div>
+          <Button onClick={onClose}>关闭</Button>
+        </div>
+        <div className="max-h-[80vh] overflow-y-auto pr-1">{children}</div>
+      </div>
+    </div>
   );
 }

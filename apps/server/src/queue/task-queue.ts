@@ -1,9 +1,11 @@
-import type {
-  AppSettings,
-  DetectedResource,
-  TaskRecord,
-  TaskStatus,
-  ServerEvent
+import {
+  getResourceDownloadStatusLabel,
+  type AppSettings,
+  type DetectedResource,
+  type ResourceDownloadStatus,
+  type TaskRecord,
+  type TaskStatus,
+  type ServerEvent
 } from "@video/shared";
 
 import type { AppStore } from "../persistence/app-store.js";
@@ -16,7 +18,7 @@ export interface BrowserSessionLike {
 }
 
 export interface BrowserManagerLike {
-  openSession(options: { siteHost: string; url: string }): Promise<BrowserSessionLike>;
+  openSession(options: { siteHost: string; url?: string }): Promise<BrowserSessionLike>;
 }
 
 export interface DetectionResult {
@@ -40,12 +42,21 @@ export interface TaskQueueDependencies {
         totalBytes: number | null;
         speedBytesPerSecond: number | null;
       }): void;
+      onStatusChange?(snapshot: {
+        status: ActiveDownloadStatus;
+        outputFilePath: string | null;
+      }): void;
     }
   ) => Promise<DownloadResult>;
   autoDownload?: boolean | (() => boolean);
   settings?: Pick<AppSettings, "maxConcurrentDownloads">;
   publishEvent?: (event: ServerEvent) => void;
 }
+
+type ActiveDownloadStatus = Exclude<
+  ResourceDownloadStatus,
+  "idle" | "completed" | "failed"
+>;
 
 export interface TaskQueue {
   submit(urls: string[]): Promise<TaskRecord[]>;
@@ -94,8 +105,7 @@ async function processTask(
     emitTaskLog(dependencies, task.id, "info", "task started");
 
     session = await dependencies.browserManager.openSession({
-      siteHost: task.siteHost,
-      url: task.sourceUrl
+      siteHost: task.siteHost
     });
 
     const detection = await dependencies.detectResources({
@@ -127,6 +137,16 @@ async function processTask(
 
     const manageableResources = detection.resources.filter(isQueueableResource);
     dependencies.store.clearTaskResources(task.id);
+
+    if (manageableResources.length === 0) {
+      const message =
+        detection.resources.length > 0
+          ? "detected resources are not supported for download"
+          : detection.message ?? "no video resources detected";
+      transitionTaskStatus(dependencies, task.id, "failed", message);
+      emitTaskLog(dependencies, task.id, "error", message);
+      return dependencies.store.getTaskDetail(task.id).task;
+    }
 
     const storedResources = manageableResources.map((resource) =>
       dependencies.store.addResource(task.id, {
@@ -222,7 +242,14 @@ async function downloadSelectedResources(
 
   const failures: string[] = [];
   for (const resource of resourcesToDownload) {
-    emitResourceProgress(dependencies, {
+    emitTaskLog(
+      dependencies,
+      taskId,
+      "info",
+      `${describeResource(resource)}：开始下载`
+    );
+
+    let currentResource: DetectedResource = {
       ...resource,
       downloadStatus: "downloading",
       downloadedBytes: 0,
@@ -230,45 +257,83 @@ async function downloadSelectedResources(
       speedBytesPerSecond: null,
       outputFilePath: null,
       errorMessage: null
-    });
+    };
+    let lastLoggedStatus: ActiveDownloadStatus | null = "downloading";
+    emitResourceProgress(dependencies, currentResource);
 
     try {
       const result = await dependencies.downloadResource(resource, {
+        onStatusChange(snapshot) {
+          if (snapshot.status !== lastLoggedStatus) {
+            emitTaskLog(
+              dependencies,
+              taskId,
+              "info",
+              buildStageLogMessage(resource, snapshot.status)
+            );
+            lastLoggedStatus = snapshot.status;
+          }
+          currentResource = {
+            ...currentResource,
+            downloadStatus: snapshot.status,
+            downloadedBytes: currentResource.downloadedBytes,
+            totalBytes: currentResource.totalBytes,
+            speedBytesPerSecond: null,
+            outputFilePath: snapshot.outputFilePath,
+            errorMessage: null
+          };
+          emitResourceProgress(dependencies, currentResource);
+        },
         onProgress(progress) {
-          emitResourceProgress(dependencies, {
-            ...resource,
+          currentResource = {
+            ...currentResource,
             downloadStatus: "downloading",
             downloadedBytes: progress.downloadedBytes,
             totalBytes: progress.totalBytes,
             speedBytesPerSecond: progress.speedBytesPerSecond,
-            outputFilePath: null,
+            outputFilePath: currentResource.outputFilePath,
             errorMessage: null
-          });
+          };
+          emitResourceProgress(dependencies, currentResource);
         }
       });
 
-      emitResourceProgress(dependencies, {
-        ...resource,
+      currentResource = {
+        ...currentResource,
         downloadStatus: "completed",
         downloadedBytes: result.downloadedBytes,
         totalBytes: result.totalBytes,
         speedBytesPerSecond: null,
         outputFilePath: result.filePath,
         errorMessage: null
-      });
+      };
+      emitResourceProgress(dependencies, currentResource);
+      emitTaskLog(
+        dependencies,
+        taskId,
+        "info",
+        `${describeResource(resource)}：下载完成`
+      );
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "unknown download failure";
       failures.push(message);
-      emitResourceProgress(dependencies, {
-        ...resource,
+      currentResource = {
+        ...currentResource,
         downloadStatus: "failed",
-        downloadedBytes: resource.downloadedBytes,
-        totalBytes: resource.totalBytes,
+        downloadedBytes: currentResource.downloadedBytes,
+        totalBytes: currentResource.totalBytes,
         speedBytesPerSecond: null,
-        outputFilePath: null,
+        outputFilePath: currentResource.outputFilePath,
         errorMessage: message
-      });
+      };
+      emitResourceProgress(dependencies, currentResource);
+      emitTaskLog(
+        dependencies,
+        taskId,
+        "error",
+        `${describeResource(resource)}：下载失败 - ${message}`
+      );
     }
   }
 
@@ -359,4 +424,23 @@ function isQueueableResource(resource: DetectedResource): boolean {
   }
 
   return true;
+}
+
+function buildStageLogMessage(
+  resource: Pick<DetectedResource, "format" | "titleHint" | "url">,
+  status: ActiveDownloadStatus
+): string {
+  if (status === "merging") {
+    return `${describeResource(resource)}：开始合并 m3u8 分片`;
+  }
+  if (status === "remuxing") {
+    return `${describeResource(resource)}：开始转 MP4`;
+  }
+  return `${describeResource(resource)}：${getResourceDownloadStatusLabel(status)}`;
+}
+
+function describeResource(
+  resource: Pick<DetectedResource, "titleHint" | "url">
+): string {
+  return resource.titleHint?.trim() || resource.url;
 }

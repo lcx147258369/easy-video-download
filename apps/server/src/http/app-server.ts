@@ -43,6 +43,7 @@ export interface AppServerDependencies {
   eventHub?: EventHub;
   staticDirectory?: string | null;
   pickDirectory?: () => Promise<string | null>;
+  revealFileInOs?: (filePath: string) => Promise<void>;
 }
 
 export function createAppServer(dependencies: AppServerDependencies): {
@@ -216,6 +217,44 @@ export function createAppServer(dependencies: AppServerDependencies): {
 
     response.setHeader("content-disposition", "inline");
     response.sendFile(resource.outputFilePath);
+  });
+
+  app.post("/api/resources/:resourceId/reveal", async (request, response, next) => {
+    try {
+      if (!dependencies.revealFileInOs) {
+        response.status(501).json({ error: "reveal file is not available" });
+        return;
+      }
+
+      const resource = dependencies
+        .store
+        .listManagedResources()
+        .find((item) => item.id === request.params.resourceId);
+
+      if (!resource || !resource.outputFilePath) {
+        response.status(404).json({ error: "downloaded resource not found" });
+        return;
+      }
+
+      if (!existsSync(resource.outputFilePath)) {
+        response.status(404).json({ error: "downloaded file not found on disk" });
+        return;
+      }
+
+      const stats = statSync(resource.outputFilePath);
+      if (!stats.isFile()) {
+        response.status(400).json({ error: "downloaded resource is not a file" });
+        return;
+      }
+
+      await dependencies.revealFileInOs(resource.outputFilePath);
+      response.json({
+        revealed: true,
+        filePath: resource.outputFilePath
+      });
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.post("/api/tasks/:taskId/browser/open", async (request, response, next) => {

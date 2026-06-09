@@ -14,7 +14,10 @@ import { pipeline } from "node:stream/promises";
 import { spawn as defaultSpawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 
-import type { DetectedResource } from "@video/shared";
+import type {
+  DetectedResource,
+  ResourceDownloadStatus
+} from "@video/shared";
 
 const require = createRequire(import.meta.url);
 
@@ -48,8 +51,19 @@ export interface DownloadManager {
     resource: DetectedResource,
     options?: {
       onProgress?(snapshot: DownloadProgressSnapshot): void;
+      onStatusChange?(snapshot: DownloadStatusSnapshot): void;
     }
   ): Promise<DownloadResult>;
+}
+
+type ActiveDownloadStatus = Exclude<
+  ResourceDownloadStatus,
+  "idle" | "completed" | "failed"
+>;
+
+interface DownloadStatusSnapshot {
+  status: ActiveDownloadStatus;
+  outputFilePath: string | null;
 }
 
 export function createDownloadManager(
@@ -65,7 +79,7 @@ export function createDownloadManager(
     options.ffmpegExecutable === undefined
       ? resolveExecutablePath("ffmpeg", {
           bundledPath: resolveBundledFfmpegExecutable(),
-          fallbackToCommand: false
+          fallbackToCommand: true
         })
       : options.ffmpegExecutable;
 
@@ -85,6 +99,10 @@ export function createDownloadManager(
         const nativeOutputPath = ffmpegExecutable ? `${outputPath}.ts` : outputPath;
         const nativeTempOutputPath = `${nativeOutputPath}.part`;
         try {
+          runtimeOptions?.onStatusChange?.({
+            status: "downloading",
+            outputFilePath: null
+          });
           const hlsResult = await downloadHlsPlaylist({
             resource,
             outputPath: nativeTempOutputPath,
@@ -93,12 +111,17 @@ export function createDownloadManager(
           });
           renameSync(nativeTempOutputPath, nativeOutputPath);
           if (ffmpegExecutable) {
+            runtimeOptions?.onStatusChange?.({
+              status: "remuxing",
+              outputFilePath: nativeOutputPath
+            });
             await remuxToMp4(
               ffmpegExecutable,
               spawnImpl,
               nativeOutputPath,
               outputPath
             );
+            cleanupTemporaryArtifacts(nativeOutputPath);
             cleanupTemporaryArtifacts(outputPath);
             rmSync(nativeOutputPath, { force: true });
             return {
@@ -108,6 +131,7 @@ export function createDownloadManager(
               method: "remux"
             };
           }
+          cleanupTemporaryArtifacts(nativeOutputPath);
           cleanupTemporaryArtifacts(outputPath);
           return {
             filePath: outputPath,
@@ -116,6 +140,10 @@ export function createDownloadManager(
             method: "direct"
           };
         } catch (nativeError) {
+          runtimeOptions?.onStatusChange?.({
+            status: "merging",
+            outputFilePath: outputPath
+          });
           await runYtDlp(
             ytDlpExecutable,
             spawnImpl,
@@ -133,6 +161,10 @@ export function createDownloadManager(
         };
       }
 
+      runtimeOptions?.onStatusChange?.({
+        status: "downloading",
+        outputFilePath: null
+      });
       const response = await fetchImpl(resource.url, {
         headers: buildRequestHeaders(resource)
       });
@@ -519,9 +551,7 @@ async function resolveHlsPlan(
   const parsed = parseHlsManifest(playlist, url);
 
   if (parsed.kind === "master") {
-    const variant = parsed.variants.sort(
-      (left, right) => right.bandwidth - left.bandwidth
-    )[0];
+    const variant = selectPreferredVariant(parsed.variants);
     return resolveHlsPlan(variant.url, headers, fetchImpl);
   }
 
@@ -534,7 +564,14 @@ function parseHlsManifest(
 ):
   | {
       kind: "master";
-      variants: Array<{ url: string; bandwidth: number }>;
+      variants: Array<{
+        url: string;
+        bandwidth: number;
+        averageBandwidth: number;
+        resolutionWidth: number;
+        resolutionHeight: number;
+        codecs: string;
+      }>;
     }
   | {
       kind: "media";
@@ -550,7 +587,14 @@ function parseHlsManifest(
       }>;
     } {
   const lines = manifest.split(/\r?\n/).map((line) => line.trim());
-  const variants: Array<{ url: string; bandwidth: number }> = [];
+  const variants: Array<{
+    url: string;
+    bandwidth: number;
+    averageBandwidth: number;
+    resolutionWidth: number;
+    resolutionHeight: number;
+    codecs: string;
+  }> = [];
   const segments: Array<{
     url: string;
     sequence: number;
@@ -582,9 +626,14 @@ function parseHlsManifest(
       const nextLine = lines[index + 1];
       if (!nextLine || nextLine.startsWith("#")) continue;
       const attrs = parseAttributeList(line.slice("#EXT-X-STREAM-INF:".length));
+      const resolution = parseResolution(attrs.RESOLUTION);
       variants.push({
         url: new URL(nextLine, baseUrl).toString(),
-        bandwidth: Number(attrs.BANDWIDTH ?? "0")
+        bandwidth: Number(attrs.BANDWIDTH ?? "0"),
+        averageBandwidth: Number(attrs["AVERAGE-BANDWIDTH"] ?? attrs.BANDWIDTH ?? "0"),
+        resolutionWidth: resolution.width,
+        resolutionHeight: resolution.height,
+        codecs: attrs.CODECS ?? ""
       });
       continue;
     }
@@ -635,8 +684,32 @@ function parseHlsManifest(
 }
 
 function parseAttributeList(input: string): Record<string, string> {
+  const entries: string[] = [];
+  let current = "";
+  let inQuotes = false;
+
+  for (const char of input) {
+    if (char === '"') {
+      inQuotes = !inQuotes;
+      current += char;
+      continue;
+    }
+    if (char === "," && !inQuotes) {
+      if (current.trim()) {
+        entries.push(current.trim());
+      }
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+
+  if (current.trim()) {
+    entries.push(current.trim());
+  }
+
   return Object.fromEntries(
-    input.split(",").map((entry) => {
+    entries.map((entry) => {
       const [key, ...rest] = entry.split("=");
       return [key.trim(), rest.join("=").replace(/^"|"$/g, "")];
     })
@@ -739,6 +812,80 @@ function formatHeaderName(key: string): string {
     .split("-")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join("-");
+}
+
+function parseResolution(value: string | undefined): {
+  width: number;
+  height: number;
+} {
+  if (!value) {
+    return {
+      width: 0,
+      height: 0
+    };
+  }
+
+  const [width, height] = value.split("x").map((part) => Number(part));
+  return {
+    width: Number.isFinite(width) ? width : 0,
+    height: Number.isFinite(height) ? height : 0
+  };
+}
+
+function selectPreferredVariant(
+  variants: Array<{
+    url: string;
+    bandwidth: number;
+    averageBandwidth: number;
+    resolutionWidth: number;
+    resolutionHeight: number;
+    codecs: string;
+  }>
+): {
+  url: string;
+  bandwidth: number;
+  averageBandwidth: number;
+  resolutionWidth: number;
+  resolutionHeight: number;
+  codecs: string;
+} {
+  return [...variants].sort((left, right) => {
+    const resolutionDiff =
+      right.resolutionWidth * right.resolutionHeight -
+      left.resolutionWidth * left.resolutionHeight;
+    if (resolutionDiff !== 0) {
+      return resolutionDiff;
+    }
+
+    const bandwidthDiff = right.averageBandwidth - left.averageBandwidth;
+    if (bandwidthDiff !== 0) {
+      return bandwidthDiff;
+    }
+
+    const codecDiff = scoreCodecs(right.codecs) - scoreCodecs(left.codecs);
+    if (codecDiff !== 0) {
+      return codecDiff;
+    }
+
+    return right.bandwidth - left.bandwidth;
+  })[0];
+}
+
+function scoreCodecs(codecs: string): number {
+  const value = codecs.toLowerCase();
+  if (value.includes("av01")) {
+    return 4;
+  }
+  if (value.includes("hvc1") || value.includes("hev1")) {
+    return 3;
+  }
+  if (value.includes("avc1")) {
+    return 2;
+  }
+  if (value.includes("vp9")) {
+    return 1;
+  }
+  return 0;
 }
 
 function cleanupTemporaryArtifacts(outputPath: string): void {

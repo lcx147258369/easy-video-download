@@ -46,6 +46,17 @@ export interface VideoTrafficCollector {
   snapshot(): DetectedResource[];
 }
 
+export interface VideoPerformanceResourceEntry {
+  name: string;
+  initiatorType?: string;
+}
+
+export interface VideoCapturedMediaEntry {
+  url: string;
+  contentType?: string | null;
+  referer?: string | null;
+}
+
 export interface VideoResourceClassification {
   url: string;
   format: DetectedResource["format"];
@@ -124,6 +135,137 @@ export function extractDomVideoCandidates(
       cookie: null,
       headers: {},
       titleHint: document.title || null,
+      sizeHint: null,
+      selected: false,
+      downloadStatus: "idle",
+      downloadedBytes: 0,
+      totalBytes: null,
+      speedBytesPerSecond: null,
+      outputFilePath: null,
+      errorMessage: null
+    });
+  }
+
+  return dedupeVideoCandidates(candidates);
+}
+
+export function extractVideoCandidatesFromPerformanceEntries(
+  entries: VideoPerformanceResourceEntry[],
+  options: DomVideoExtractionOptions & {
+    titleHint?: string | null;
+  }
+): DetectedResource[] {
+  const candidates: DetectedResource[] = [];
+
+  for (const entry of entries) {
+    const classification = classifyVideoResource({
+      url: entry.name
+    });
+    if (!classification) {
+      continue;
+    }
+
+    candidates.push({
+      id: randomUUID(),
+      taskId: options.taskId,
+      url: classification.url,
+      format: classification.format,
+      mimeType: classification.mimeType,
+      referer: options.pageUrl,
+      userAgent: options.userAgent ?? null,
+      cookie: null,
+      headers: {},
+      titleHint: options.titleHint ?? null,
+      sizeHint: null,
+      selected: false,
+      downloadStatus: "idle",
+      downloadedBytes: 0,
+      totalBytes: null,
+      speedBytesPerSecond: null,
+      outputFilePath: null,
+      errorMessage: null
+    });
+  }
+
+  return dedupeVideoCandidates(candidates);
+}
+
+export function extractVideoCandidatesFromCapturedEntries(
+  entries: VideoCapturedMediaEntry[],
+  options: DomVideoExtractionOptions & {
+    titleHint?: string | null;
+  }
+): DetectedResource[] {
+  const candidates: DetectedResource[] = [];
+
+  for (const entry of entries) {
+    const classification = classifyVideoResource({
+      url: entry.url,
+      contentType: entry.contentType ?? null
+    });
+    if (!classification) {
+      continue;
+    }
+
+    candidates.push({
+      id: randomUUID(),
+      taskId: options.taskId,
+      url: classification.url,
+      format: classification.format,
+      mimeType: classification.mimeType,
+      referer: entry.referer ?? options.pageUrl,
+      userAgent: options.userAgent ?? null,
+      cookie: null,
+      headers: {},
+      titleHint: options.titleHint ?? null,
+      sizeHint: null,
+      selected: false,
+      downloadStatus: "idle",
+      downloadedBytes: 0,
+      totalBytes: null,
+      speedBytesPerSecond: null,
+      outputFilePath: null,
+      errorMessage: null
+    });
+  }
+
+  return dedupeVideoCandidates(candidates);
+}
+
+export function extractVideoCandidatesFromText(
+  text: string,
+  options: DomVideoExtractionOptions & {
+    titleHint?: string | null;
+  }
+): DetectedResource[] {
+  const normalized = text
+    .replace(/\\u002F/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/gi, "&");
+  const matches =
+    normalized.match(
+      /https?:\/\/[^\s"'`<>]+?\.(?:m3u8|mp4|webm)(?:\?[^"'`\s<>]*)?/gi
+    ) ?? [];
+  const candidates: DetectedResource[] = [];
+
+  for (const rawMatch of matches) {
+    const url = rawMatch.replace(/[),.;]+$/g, "");
+    const classification = classifyVideoResource({ url });
+    if (!classification) {
+      continue;
+    }
+
+    candidates.push({
+      id: randomUUID(),
+      taskId: options.taskId,
+      url: classification.url,
+      format: classification.format,
+      mimeType: classification.mimeType,
+      referer: options.pageUrl,
+      userAgent: options.userAgent ?? null,
+      cookie: null,
+      headers: {},
+      titleHint: options.titleHint ?? null,
       sizeHint: null,
       selected: false,
       downloadStatus: "idle",

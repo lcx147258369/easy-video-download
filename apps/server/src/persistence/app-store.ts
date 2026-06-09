@@ -482,7 +482,7 @@ function readTaskDetail(database: DatabaseSync, taskId: string): TaskDetail {
     throw new Error(`task not found: ${taskId}`);
   }
 
-  const reconciledTask = reconcileTaskRow(database, task);
+  const settings = readSettings(database, ".");
 
   const resourceRows = database
     .prepare(
@@ -498,6 +498,18 @@ function readTaskDetail(database: DatabaseSync, taskId: string): TaskDetail {
     )
     .all(taskId) as ResourceRow[];
 
+  const resources = resourceRows
+    .map(mapResourceRow)
+    .map((resource) =>
+      reconcileResourceRow(database, resource, settings.downloadDirectory)
+    )
+    .filter(isQueueableResource);
+
+  const reconciledTask = reconcileTaskRow(
+    database,
+    readTaskRow(database, taskId) ?? task
+  );
+
   const logRows = database
     .prepare(
       `
@@ -511,9 +523,7 @@ function readTaskDetail(database: DatabaseSync, taskId: string): TaskDetail {
 
   return {
     task: mapTaskRow(reconciledTask),
-    resources: resourceRows
-      .map(mapResourceRow)
-      .filter(isQueueableResource),
+    resources,
     logs: logRows.map((row) => ({
       id: row.id,
       taskId: row.task_id,
@@ -526,15 +536,6 @@ function readTaskDetail(database: DatabaseSync, taskId: string): TaskDetail {
 
 function readManagedResources(database: DatabaseSync): ManagedVideoItem[] {
   const settings = readSettings(database, ".");
-  const tasks = new Map<string, TaskRow>();
-  for (const row of database
-    .prepare(
-      "SELECT id, source_url, status, title, site_host, created_at, updated_at, error_message FROM tasks"
-    )
-    .all() as TaskRow[]) {
-    tasks.set(row.id, reconcileTaskRow(database, row));
-  }
-
   const rows = database
     .prepare(
       `
@@ -577,13 +578,27 @@ function readManagedResources(database: DatabaseSync): ManagedVideoItem[] {
       }
     >;
 
-  return rows
-    .map((row) => ({
-      ...reconcileResourceRow(
-        database,
-        mapResourceRow(row),
-        settings.downloadDirectory
-      ),
+  const reconciledResources = rows.map((row) => ({
+    row,
+    resource: reconcileResourceRow(
+      database,
+      mapResourceRow(row),
+      settings.downloadDirectory
+    )
+  }));
+
+  const tasks = new Map<string, TaskRow>();
+  for (const row of database
+    .prepare(
+      "SELECT id, source_url, status, title, site_host, created_at, updated_at, error_message FROM tasks"
+    )
+    .all() as TaskRow[]) {
+    tasks.set(row.id, reconcileTaskRow(database, row));
+  }
+
+  return reconciledResources
+    .map(({ row, resource }) => ({
+      ...resource,
       sourceUrl: row.source_url,
       siteHost: row.site_host,
       taskStatus: tasks.get(row.task_id)?.status ?? row.status,
@@ -719,7 +734,11 @@ function reconcileResourceRow(
   resource: DetectedResource,
   downloadDirectory: string
 ): DetectedResource {
-  if (resource.downloadStatus !== "downloading") {
+  if (
+    resource.downloadStatus !== "downloading" &&
+    resource.downloadStatus !== "merging" &&
+    resource.downloadStatus !== "remuxing"
+  ) {
     return resource;
   }
 
@@ -729,15 +748,88 @@ function reconcileResourceRow(
     return resource;
   }
 
+  if (resource.downloadStatus === "remuxing") {
+    const finalOutputPath = findExpectedCompletedOutputPath(resource, downloadDirectory);
+    if (finalOutputPath && existsSync(finalOutputPath)) {
+      const stats = statSync(finalOutputPath);
+      return writeResourceDownloadState(database, resource.id, {
+        downloadStatus: "completed",
+        downloadedBytes: Number(stats.size),
+        totalBytes: Number(stats.size),
+        speedBytesPerSecond: null,
+        outputFilePath: finalOutputPath,
+        errorMessage: null
+      });
+    }
+
+    if (!existsSync(outputPath)) {
+      if (!hasRecentDownloadActivity(outputPath)) {
+        return writeResourceDownloadState(database, resource.id, {
+          downloadStatus: "failed",
+          downloadedBytes: resource.downloadedBytes,
+          totalBytes: resource.totalBytes,
+          speedBytesPerSecond: null,
+          outputFilePath: null,
+          errorMessage: resource.errorMessage ?? "下载中断，请重试该资源"
+        });
+      }
+      return {
+        ...resource,
+        outputFilePath: outputPath
+      };
+    }
+
+    if (hasRecentDownloadActivity(outputPath)) {
+      return {
+        ...resource,
+        outputFilePath: outputPath
+      };
+    }
+
+    return writeResourceDownloadState(database, resource.id, {
+      downloadStatus: "failed",
+      downloadedBytes: Number(statSync(outputPath).size),
+      totalBytes: resource.totalBytes,
+      speedBytesPerSecond: null,
+      outputFilePath: outputPath,
+      errorMessage: resource.errorMessage ?? "下载中断，请重试该资源"
+    });
+  }
+
   if (hasTemporaryArtifacts(outputPath)) {
+    if (hasRecentDownloadActivity(outputPath)) {
+      return {
+        ...resource,
+        outputFilePath: outputPath
+      };
+    }
+
+    const completedBytes = existsSync(outputPath) ? Number(statSync(outputPath).size) : 0;
+    return writeResourceDownloadState(database, resource.id, {
+      downloadStatus: "failed",
+      downloadedBytes: completedBytes,
+      totalBytes: resource.totalBytes,
+      speedBytesPerSecond: null,
+      outputFilePath: existsSync(outputPath) ? outputPath : null,
+      errorMessage: resource.errorMessage ?? "下载中断，请重试该资源"
+    });
+  }
+
+  if (!existsSync(outputPath)) {
+    if (!hasRecentDownloadActivity(outputPath)) {
+      return writeResourceDownloadState(database, resource.id, {
+        downloadStatus: "failed",
+        downloadedBytes: resource.downloadedBytes,
+        totalBytes: resource.totalBytes,
+        speedBytesPerSecond: null,
+        outputFilePath: null,
+        errorMessage: resource.errorMessage ?? "下载中断，请重试该资源"
+      });
+    }
     return {
       ...resource,
       outputFilePath: outputPath
     };
-  }
-
-  if (!existsSync(outputPath)) {
-    return resource;
   }
 
   const stats = statSync(outputPath);
@@ -749,6 +841,27 @@ function reconcileResourceRow(
     outputFilePath: outputPath,
     errorMessage: null
   });
+}
+
+function findExpectedCompletedOutputPath(
+  resource: DetectedResource,
+  downloadDirectory: string
+): string | null {
+  const sourceName = extractSourceName(resource.url);
+  const baseName = sanitizeFileName(
+    resource.titleHint?.trim() || sourceName || `video-${resource.id}`
+  );
+
+  if (resource.format === "m3u8") {
+    return join(downloadDirectory, `${baseName}.mp4`);
+  }
+  if (resource.format === "webm") {
+    return join(downloadDirectory, `${baseName}.webm`);
+  }
+  if (resource.format === "mp4") {
+    return join(downloadDirectory, `${baseName}.mp4`);
+  }
+  return join(downloadDirectory, `${baseName}.bin`);
 }
 
 function isQueueableResource(resource: Pick<DetectedResource, "url" | "format">): boolean {
@@ -796,6 +909,38 @@ function hasTemporaryArtifacts(outputPath: string): boolean {
       entry.isFile() &&
       entry.name.startsWith(`${fileName}-Frag`)
   );
+}
+
+function hasRecentDownloadActivity(outputPath: string): boolean {
+  const cutoff = Date.now() - 90_000;
+  return listDownloadArtifacts(outputPath).some((artifactPath) => {
+    if (!existsSync(artifactPath)) {
+      return false;
+    }
+    return statSync(artifactPath).mtimeMs >= cutoff;
+  });
+}
+
+function listDownloadArtifacts(outputPath: string): string[] {
+  const artifacts = [outputPath, `${outputPath}.part`, `${outputPath}.ytdl`];
+  const directory = dirname(outputPath);
+  const fileName = outputPath.split("/").pop() ?? outputPath;
+
+  if (!existsSync(directory)) {
+    return artifacts;
+  }
+
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    if (!entry.name.startsWith(`${fileName}-Frag`)) {
+      continue;
+    }
+    artifacts.push(join(directory, entry.name));
+  }
+
+  return artifacts;
 }
 
 function extractSourceName(url: string): string {
@@ -847,6 +992,15 @@ function reconcileTaskRow(database: DatabaseSync, task: TaskRow): TaskRow {
     .filter(isQueueableResource);
 
   if (manageableResources.length === 0) {
+    if (task.status === "detected" || task.status === "downloading") {
+      writeTaskStatus(
+        database,
+        task.id,
+        "failed",
+        task.error_message ?? "no downloadable resources available"
+      );
+      return readTaskRow(database, task.id) ?? task;
+    }
     return task;
   }
 

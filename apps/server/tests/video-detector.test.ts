@@ -100,4 +100,85 @@ describe("video detector", () => {
       ])
     ).toHaveLength(1);
   });
+
+  it("extracts media urls from escaped inline script text", async () => {
+    const { extractVideoCandidatesFromText } = await import(
+      "../src/browser/video-detector.js"
+    );
+
+    const candidates = extractVideoCandidatesFromText(
+      'player={url:"https:\\/\\/cdn.example.com\\/master.m3u8?token=1"};',
+      {
+        taskId: "task-1",
+        pageUrl: "https://example.com/watch"
+      }
+    );
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      format: "m3u8",
+      url: "https://cdn.example.com/master.m3u8?token=1"
+    });
+  });
+
+  it("extracts media urls from performance entries", async () => {
+    const { extractVideoCandidatesFromPerformanceEntries } = await import(
+      "../src/browser/video-detector.js"
+    );
+
+    const candidates = extractVideoCandidatesFromPerformanceEntries(
+      [
+        {
+          name: "https://cdn.example.com/master.m3u8?sign=abc",
+          initiatorType: "fetch"
+        },
+        {
+          name: "https://example.com/app.js",
+          initiatorType: "script"
+        }
+      ],
+      {
+        taskId: "task-1",
+        pageUrl: "https://example.com/watch"
+      }
+    );
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      format: "m3u8",
+      url: "https://cdn.example.com/master.m3u8?sign=abc"
+    });
+  });
+
+  it("extracts media urls from captured fetch/xhr entries using content type", async () => {
+    const { extractVideoCandidatesFromCapturedEntries } = await import(
+      "../src/browser/video-detector.js"
+    );
+
+    const candidates = extractVideoCandidatesFromCapturedEntries(
+      [
+        {
+          url: "https://example.com/api/video-source?id=1",
+          contentType: "application/vnd.apple.mpegurl",
+          referer: "https://example.com/watch"
+        },
+        {
+          url: "https://example.com/assets/app.js",
+          contentType: "application/javascript",
+          referer: "https://example.com/watch"
+        }
+      ],
+      {
+        taskId: "task-1",
+        pageUrl: "https://example.com/watch"
+      }
+    );
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      format: "m3u8",
+      url: "https://example.com/api/video-source?id=1",
+      referer: "https://example.com/watch"
+    });
+  });
 });

@@ -49,7 +49,8 @@ const { app } = createAppServer({
   browserManager,
   eventHub,
   staticDirectory: join(rootDirectory, "apps", "web", "dist"),
-  pickDirectory: pickDirectoryWithOsDialog
+  pickDirectory: pickDirectoryWithOsDialog,
+  revealFileInOs: revealFileInFinder
 });
 
 const port = Number(process.env.PORT ?? 4318);
@@ -105,4 +106,8 @@ async function pickDirectoryWithOsDialog(): Promise<string | null> {
   const { stdout } = await execFileAsync("osascript", ["-e", script]);
   const directoryPath = stdout.trim();
   return directoryPath.length > 0 ? directoryPath.replace(/\/$/, "") : null;
+}
+
+async function revealFileInFinder(filePath: string): Promise<void> {
+  await execFileAsync("open", ["-R", filePath]);
 }

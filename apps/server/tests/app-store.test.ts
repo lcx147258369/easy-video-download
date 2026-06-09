@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -163,5 +163,110 @@ describe("app store", () => {
 
     expect(reconciledTask.status).toBe("completed");
     expect(managedResource.taskStatus).toBe("completed");
+  });
+
+  it("reconciles a stale detected task with no resources to failed", () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "video-store-"));
+    createdPaths.push(rootDir);
+
+    const store = createAppStore(join(rootDir, "app.db"), rootDir);
+    const [task] = store.createTasks(["https://example.com/video/1"]);
+
+    store.updateTaskStatus(task.id, "detected");
+
+    const [reconciledTask] = store.listTasks();
+
+    expect(reconciledTask.status).toBe("failed");
+    expect(reconciledTask.errorMessage).toBe("no downloadable resources available");
+  });
+
+  it("reconciles a stale downloading resource to failed when temp artifacts stop changing", () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "video-store-"));
+    createdPaths.push(rootDir);
+
+    const store = createAppStore(join(rootDir, "app.db"), rootDir);
+    const [task] = store.createTasks(["https://example.com/video/1"]);
+    const resource = store.addResource(task.id, {
+      url: "https://cdn.example.com/video.m3u8",
+      format: "m3u8",
+      mimeType: "application/vnd.apple.mpegurl",
+      referer: task.sourceUrl,
+      userAgent: "test-agent",
+      cookie: null,
+      headers: {},
+      titleHint: "stale download",
+      sizeHint: null,
+      selected: true
+    });
+
+    const outputPath = join(rootDir, "data", "downloads", "stale download.ts");
+    mkdirSync(join(rootDir, "data", "downloads"), { recursive: true });
+    writeFileSync(outputPath, "partial-content");
+    writeFileSync(`${outputPath}.part`, "older-part");
+    writeFileSync(`${outputPath}.ytdl`, "older-state");
+
+    const staleTime = new Date(Date.now() - 5 * 60_000);
+    utimesSync(outputPath, staleTime, staleTime);
+    utimesSync(`${outputPath}.part`, staleTime, staleTime);
+    utimesSync(`${outputPath}.ytdl`, staleTime, staleTime);
+
+    store.updateResourceDownloadState(resource.id, {
+      downloadStatus: "downloading",
+      downloadedBytes: 123,
+      totalBytes: null,
+      speedBytesPerSecond: null,
+      outputFilePath: outputPath,
+      errorMessage: null
+    });
+    store.updateTaskStatus(task.id, "downloading");
+
+    const detail = store.getTaskDetail(task.id);
+
+    expect(detail.resources[0].downloadStatus).toBe("failed");
+    expect(detail.resources[0].errorMessage).toBe("下载中断，请重试该资源");
+    expect(detail.task.status).toBe("failed");
+  });
+
+  it("reconciles a stale remuxing resource to failed when only the intermediate ts remains", () => {
+    const rootDir = mkdtempSync(join(tmpdir(), "video-store-"));
+    createdPaths.push(rootDir);
+
+    const store = createAppStore(join(rootDir, "app.db"), rootDir);
+    const [task] = store.createTasks(["https://example.com/video/1"]);
+    const resource = store.addResource(task.id, {
+      url: "https://cdn.example.com/video.m3u8",
+      format: "m3u8",
+      mimeType: "application/vnd.apple.mpegurl",
+      referer: task.sourceUrl,
+      userAgent: "test-agent",
+      cookie: null,
+      headers: {},
+      titleHint: "remux target",
+      sizeHint: null,
+      selected: true
+    });
+
+    const intermediatePath = join(rootDir, "data", "downloads", "remux target.mp4.ts");
+    mkdirSync(join(rootDir, "data", "downloads"), { recursive: true });
+    writeFileSync(intermediatePath, "transport-stream-intermediate");
+
+    const staleTime = new Date(Date.now() - 5 * 60_000);
+    utimesSync(intermediatePath, staleTime, staleTime);
+
+    store.updateResourceDownloadState(resource.id, {
+      downloadStatus: "remuxing",
+      downloadedBytes: 321,
+      totalBytes: null,
+      speedBytesPerSecond: null,
+      outputFilePath: intermediatePath,
+      errorMessage: null
+    });
+    store.updateTaskStatus(task.id, "downloading");
+
+    const detail = store.getTaskDetail(task.id);
+
+    expect(detail.resources[0].downloadStatus).toBe("failed");
+    expect(detail.resources[0].outputFilePath).toBe(intermediatePath);
+    expect(detail.resources[0].errorMessage).toBe("下载中断，请重试该资源");
   });
 });

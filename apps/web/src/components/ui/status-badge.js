@@ -1,14 +1,15 @@
-import { jsx as _jsx } from "react/jsx-runtime";
+import { jsxs as _jsxs, jsx as _jsx } from "react/jsx-runtime";
 import { cn } from "./cn";
 const toneByStatus = {
-    pending: "border-white/10 bg-white/5 text-ink-200",
-    running: "border-signal-info/30 bg-signal-info/10 text-[#9ddfff]",
-    needs_login: "border-signal-warn/30 bg-signal-warn/10 text-[#ffe2a3]",
-    detected: "border-signal-accent/30 bg-signal-accent/10 text-[#9ef4ea]",
-    downloading: "border-[#25b8ff]/30 bg-[#25b8ff]/10 text-[#abddff]",
-    completed: "border-signal-success/30 bg-signal-success/10 text-[#b8f5de]",
-    failed: "border-signal-danger/30 bg-signal-danger/10 text-[#ffc8d0]"
+    pending: { dot: "bg-zinc-400", text: "text-zinc-500" },
+    running: { dot: "bg-slate-600", text: "text-slate-700" },
+    needs_login: { dot: "bg-amber-600", text: "text-amber-700" },
+    detected: { dot: "bg-teal-600", text: "text-teal-700" },
+    downloading: { dot: "bg-sky-600", text: "text-sky-700" },
+    completed: { dot: "bg-emerald-600", text: "text-emerald-700" },
+    failed: { dot: "bg-rose-600", text: "text-rose-700" }
 };
 export function StatusBadge({ status, label }) {
-    return (_jsx("span", { className: cn("inline-flex rounded-full border px-3 py-1 text-xs font-semibold tracking-[0.16em] uppercase", toneByStatus[status]), children: label }));
+    const tone = toneByStatus[status];
+    return (_jsxs("span", { className: cn("inline-flex items-center gap-2 text-[13px] font-semibold leading-none", tone.text), children: [_jsx("span", { className: cn("h-2 w-2 shrink-0 rounded-full", tone.dot) }), label] }));
 }
