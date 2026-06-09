@@ -1,4 +1,11 @@
-import { existsSync, mkdirSync, renameSync, createWriteStream } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  renameSync,
+  createWriteStream,
+  readdirSync,
+  rmSync
+} from "node:fs";
 import { createDecipheriv } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, extname, join } from "node:path";
@@ -27,7 +34,7 @@ export interface DownloadResult {
   filePath: string;
   downloadedBytes: number;
   totalBytes: number | null;
-  method: "direct" | "yt-dlp";
+  method: "direct" | "remux" | "yt-dlp";
 }
 
 export interface DownloadProgressSnapshot {
@@ -75,14 +82,33 @@ export function createDownloadManager(
       mkdirSync(dirname(outputPath), { recursive: true });
 
       if (resource.format === "m3u8") {
+        const nativeOutputPath = ffmpegExecutable ? `${outputPath}.ts` : outputPath;
+        const nativeTempOutputPath = `${nativeOutputPath}.part`;
         try {
           const hlsResult = await downloadHlsPlaylist({
             resource,
-            outputPath: tempOutputPath,
+            outputPath: nativeTempOutputPath,
             fetchImpl,
             onProgress: runtimeOptions?.onProgress
           });
-          renameSync(tempOutputPath, outputPath);
+          renameSync(nativeTempOutputPath, nativeOutputPath);
+          if (ffmpegExecutable) {
+            await remuxToMp4(
+              ffmpegExecutable,
+              spawnImpl,
+              nativeOutputPath,
+              outputPath
+            );
+            cleanupTemporaryArtifacts(outputPath);
+            rmSync(nativeOutputPath, { force: true });
+            return {
+              filePath: outputPath,
+              downloadedBytes: hlsResult.downloadedBytes,
+              totalBytes: hlsResult.totalBytes,
+              method: "remux"
+            };
+          }
+          cleanupTemporaryArtifacts(outputPath);
           return {
             filePath: outputPath,
             downloadedBytes: hlsResult.downloadedBytes,
@@ -97,6 +123,7 @@ export function createDownloadManager(
             outputPath,
             { ffmpegExecutable }
           );
+          cleanupTemporaryArtifacts(outputPath);
         }
         return {
           filePath: outputPath,
@@ -298,6 +325,56 @@ function runYtDlp(
         return;
       }
       reject(new Error(stderr.trim() || `yt-dlp exited with code ${code}`));
+    });
+  });
+}
+
+function remuxToMp4(
+  executable: string,
+  spawnImpl: NonNullable<DownloadManagerOptions["spawnImpl"]>,
+  inputPath: string,
+  outputPath: string
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawnImpl(
+      executable,
+      [
+        "-y",
+        "-i",
+        inputPath,
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        outputPath
+      ],
+      {
+        stdio: "pipe",
+        env: buildChildEnv(executable, executable)
+      }
+    );
+
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        reject(
+          new Error(
+            `无法找到 ${executable}。请确认已安装 ffmpeg，或把它加入 PATH。`
+          )
+        );
+        return;
+      }
+      reject(error);
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
     });
   });
 }
@@ -662,4 +739,27 @@ function formatHeaderName(key: string): string {
     .split("-")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join("-");
+}
+
+function cleanupTemporaryArtifacts(outputPath: string): void {
+  const artifacts = [`${outputPath}.part`, `${outputPath}.ytdl`];
+  for (const artifact of artifacts) {
+    rmSync(artifact, { force: true });
+  }
+
+  const directory = dirname(outputPath);
+  const fileName = outputPath.split("/").pop() ?? outputPath;
+  if (!existsSync(directory)) {
+    return;
+  }
+
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    if (!entry.name.startsWith(`${fileName}-Frag`)) {
+      continue;
+    }
+    rmSync(join(directory, entry.name), { force: true });
+  }
 }
