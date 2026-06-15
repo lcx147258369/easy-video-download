@@ -494,7 +494,7 @@ export function App() {
               <div className="min-w-0 flex-1 space-y-3">
                 <div className="flex flex-wrap items-center gap-3">
                   <p className="font-mono text-[11px] uppercase tracking-[0.28em] text-stone-600">
-                    51cg Video Console
+                    Easy Video Download Console
                   </p>
                   <span className="inline-flex items-center rounded-full border border-stone-200 bg-white/80 px-3 py-1 text-[11px] font-medium text-stone-600">
                     URL {"->"} 页面任务 {"->"} 资源任务

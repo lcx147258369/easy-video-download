@@ -10,9 +10,9 @@
 
 ## 2. 当前状态基线
 - 当前仓库已完成内容包括产品文档、技术设计、工程实现与前端控制台：
-  - [PRD](/Users/licaixin/Desktop/demo/51cg-video/docs/prd.md)
-  - [Design](/Users/licaixin/Desktop/demo/51cg-video/docs/design.md)
-  - [Task](/Users/licaixin/Desktop/demo/51cg-video/docs/task.md)
+  - [PRD](prd.md)
+  - [Design](design.md)
+  - [Task](task.md)
 - 当前已具备前后端工程代码、基础测试、依赖配置和运行脚本。
 
 基线结论：

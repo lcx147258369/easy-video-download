@@ -5,4 +5,4 @@ export * from "./resource.js";
 export * from "./settings.js";
 export * from "./task.js";
 
-export const projectName = "51cg-video";
+export const projectName = "easy-video-download";

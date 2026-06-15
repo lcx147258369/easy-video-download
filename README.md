@@ -1,4 +1,4 @@
-# 51cg Video
+# Easy Video Download
 
 本地视频抓取与下载工具。给定一个或多个页面 URL，系统会打开受控浏览器会话，识别页面中的视频资源，并把可下载的视频保存到本地目录。
 
@@ -93,5 +93,5 @@ data/            SQLite、下载目录、日志目录、浏览器 profile
 
 更多运行方式、排障建议和验收步骤见：
 
-- [docs/run-local.md](/Users/licaixin/Desktop/demo/51cg-video/docs/run-local.md)
-- [docs/acceptance-checklist.md](/Users/licaixin/Desktop/demo/51cg-video/docs/acceptance-checklist.md)
+- [docs/run-local.md](docs/run-local.md)
+- [docs/acceptance-checklist.md](docs/acceptance-checklist.md)
