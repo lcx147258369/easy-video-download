@@ -32,6 +32,21 @@ describe("shared task contracts", () => {
     ]);
   });
 
+  it("extracts multiple urls from mixed pasted text", () => {
+    expect(
+      parseTaskUrlInput(`
+        第一组：https://example.com/video/1 https://example.com/video/2
+        第二组，https://example.com/video/3，https://example.com/video/3
+        说明文字 (https://example.com/video/4)
+      `)
+    ).toEqual([
+      "https://example.com/video/1",
+      "https://example.com/video/2",
+      "https://example.com/video/3",
+      "https://example.com/video/4"
+    ]);
+  });
+
   it("creates sane default settings", () => {
     const settings = createDefaultSettings();
 

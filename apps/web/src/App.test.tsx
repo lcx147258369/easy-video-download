@@ -540,12 +540,19 @@ describe("App", () => {
 
     fireEvent.change(
       screen.getByRole("textbox", { name: /输入页面 URL/ }),
-      { target: { value: createdTask.sourceUrl } }
+      {
+        target: {
+          value: `${createdTask.sourceUrl} https://example.com/extra-task\n说明：https://example.com/extra-task`
+        }
+      }
     );
     fireEvent.click(screen.getByRole("button", { name: "创建页面任务" }));
 
     await waitFor(() => {
-      expect(apiState.createTasks).toHaveBeenCalledWith([createdTask.sourceUrl]);
+      expect(apiState.createTasks).toHaveBeenCalledWith([
+        createdTask.sourceUrl,
+        "https://example.com/extra-task"
+      ]);
     });
 
     await act(async () => {
